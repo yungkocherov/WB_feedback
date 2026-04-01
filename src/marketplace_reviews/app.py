@@ -36,7 +36,7 @@ def analyze():
 
     try:
         nm_id = wb.parse_url(url)
-        reviews = wb.fetch_reviews(nm_id)
+        product_info, reviews = wb.fetch_product(nm_id)
 
         if not reviews:
             return jsonify(error="Отзывов не найдено"), 404
@@ -44,19 +44,31 @@ def analyze():
         weekly = aggregate_weekly(reviews)
         df = to_dataframe(weekly)
 
-        chart_b64 = _render_chart(df, nm_id)
+        title = ""
+        if product_info:
+            title = f"{product_info.brand} — {product_info.name}"
+
+        chart_b64 = _render_chart(df, title or f"WB {nm_id}")
 
         rows = df.to_dict(orient="records")
         for r in rows:
             r["week_start"] = r["week_start"].strftime("%Y-%m-%d")
 
-        return jsonify(
+        result = dict(
             nm_id=nm_id,
             total_reviews=len(reviews),
             weeks=len(weekly),
             rows=rows,
             chart=chart_b64,
         )
+
+        if product_info:
+            result["product_name"] = f"{product_info.brand} — {product_info.name}"
+            result["product_image"] = product_info.image_url
+            result["product_rating"] = product_info.rating
+            result["product_total_feedbacks"] = product_info.total_feedbacks
+
+        return jsonify(result)
     except ValueError as e:
         return jsonify(error=str(e)), 400
     except Exception as e:
@@ -64,7 +76,7 @@ def analyze():
         return jsonify(error=f"Ошибка: {e}"), 500
 
 
-def _render_chart(df, nm_id: int) -> str:
+def _render_chart(df, title: str) -> str:
     fig, ax1 = plt.subplots(figsize=(10, 4))
 
     color_rating = "#2563eb"
@@ -85,7 +97,7 @@ def _render_chart(df, nm_id: int) -> str:
     ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
     fig.autofmt_xdate(rotation=45)
 
-    plt.title(f"Еженедельный рейтинг — WB {nm_id}")
+    plt.title(title)
     fig.tight_layout()
 
     buf = io.BytesIO()

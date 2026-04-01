@@ -19,3 +19,13 @@ class WeeklyRating:
     week_start: datetime
     avg_rating: float
     review_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProductInfo:
+    nm_id: int
+    name: str
+    brand: str
+    image_url: str
+    rating: float
+    total_feedbacks: int
