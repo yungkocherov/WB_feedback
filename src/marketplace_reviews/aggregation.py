@@ -26,8 +26,8 @@ def aggregate_weekly(reviews: list[Review]) -> list[WeeklyRating]:
     return [
         WeeklyRating(
             week_start=row.week_start.to_pydatetime(),
-            avg_rating=round(row["mean"], 2),
-            review_count=int(row["count"]),
+            avg_rating=round(row.mean, 2),
+            review_count=int(row.count),
         )
         for row in grouped.itertuples()
     ]
