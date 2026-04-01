@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import time
 import logging
 from datetime import datetime, timezone
 
@@ -15,10 +14,7 @@ logger = logging.getLogger(__name__)
 _WB_URL_PATTERN = re.compile(r"wildberries\.ru/catalog/(\d+)")
 
 _CARD_DETAIL_URL = "https://card.wb.ru/cards/v4/detail"
-_FEEDBACKS_URL = "https://public-feedbacks.wildberries.ru/api/v1/feedbacks/site"
-
-_PAGE_SIZE = 30
-_REQUEST_DELAY = 0.35  # seconds between paginated requests
+_FEEDBACKS_URL = "https://feedbacks1.wb.ru/feedbacks/v1/{imt_id}"
 
 
 class WildberriesParser(BaseParser):
@@ -66,37 +62,16 @@ class WildberriesParser(BaseParser):
         return int(root)
 
     def _fetch_all_feedbacks(self, imt_id: int) -> list[Review]:
-        """Paginate through the public feedbacks endpoint."""
-        reviews: list[Review] = []
-        skip = 0
+        """Fetch all feedbacks from the feedbacks1.wb.ru endpoint."""
+        url = _FEEDBACKS_URL.format(imt_id=imt_id)
+        resp = self._session.get(url)
+        resp.raise_for_status()
+        data = resp.json()
 
-        while True:
-            payload = {
-                "imtId": imt_id,
-                "take": _PAGE_SIZE,
-                "skip": skip,
-                "order": "dateDesc",
-            }
-            resp = self._session.post(_FEEDBACKS_URL, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        feedbacks = data.get("feedbacks") or []
+        logger.info("Fetched %d reviews for imtId=%d", len(feedbacks), imt_id)
 
-            feedbacks = data.get("feedbacks") or []
-            if not feedbacks:
-                break
-
-            for fb in feedbacks:
-                reviews.append(self._to_review(fb))
-
-            logger.info("Fetched %d reviews (total so far: %d)", len(feedbacks), len(reviews))
-
-            if len(feedbacks) < _PAGE_SIZE:
-                break
-
-            skip += _PAGE_SIZE
-            time.sleep(_REQUEST_DELAY)
-
-        return reviews
+        return [self._to_review(fb) for fb in feedbacks]
 
     @staticmethod
     def _to_review(fb: dict) -> Review:
