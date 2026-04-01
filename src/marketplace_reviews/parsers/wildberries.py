@@ -56,7 +56,8 @@ class WildberriesParser(BaseParser):
             params={"appType": 1, "curr": "rub", "dest": -1257786, "nm": nm_id},
         )
         resp.raise_for_status()
-        products = resp.json().get("data", {}).get("products", [])
+        body = resp.json()
+        products = body.get("data", {}).get("products") or body.get("products") or []
         if not products:
             raise ValueError(f"Product not found for nmId={nm_id}")
         root = products[0].get("root")
