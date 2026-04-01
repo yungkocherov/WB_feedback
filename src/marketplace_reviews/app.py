@@ -37,30 +37,31 @@ def analyze():
     try:
         nm_id = wb.parse_url(url)
         reviews = wb.fetch_reviews(nm_id)
+
+        if not reviews:
+            return jsonify(error="Отзывов не найдено"), 404
+
+        weekly = aggregate_weekly(reviews)
+        df = to_dataframe(weekly)
+
+        chart_b64 = _render_chart(df, nm_id)
+
+        rows = df.to_dict(orient="records")
+        for r in rows:
+            r["week_start"] = r["week_start"].strftime("%Y-%m-%d")
+
+        return jsonify(
+            nm_id=nm_id,
+            total_reviews=len(reviews),
+            weeks=len(weekly),
+            rows=rows,
+            chart=chart_b64,
+        )
     except ValueError as e:
         return jsonify(error=str(e)), 400
     except Exception as e:
-        return jsonify(error=f"Ошибка при загрузке: {e}"), 500
-
-    if not reviews:
-        return jsonify(error="Отзывов не найдено"), 404
-
-    weekly = aggregate_weekly(reviews)
-    df = to_dataframe(weekly)
-
-    chart_b64 = _render_chart(df, nm_id)
-
-    rows = df.to_dict(orient="records")
-    for r in rows:
-        r["week_start"] = r["week_start"].strftime("%Y-%m-%d")
-
-    return jsonify(
-        nm_id=nm_id,
-        total_reviews=len(reviews),
-        weeks=len(weekly),
-        rows=rows,
-        chart=chart_b64,
-    )
+        logging.exception("Unhandled error in /analyze")
+        return jsonify(error=f"Ошибка: {e}"), 500
 
 
 def _render_chart(df, nm_id: int) -> str:

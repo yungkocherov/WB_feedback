@@ -66,8 +66,15 @@ class WildberriesParser(BaseParser):
         url = _FEEDBACKS_URL.format(imt_id=imt_id)
         resp = self._session.get(url)
         resp.raise_for_status()
-        data = resp.json()
 
+        content_type = resp.headers.get("Content-Type", "")
+        if "json" not in content_type:
+            raise ValueError(
+                f"WB feedbacks returned non-JSON response (Content-Type: {content_type}). "
+                f"The endpoint may be blocked from your network."
+            )
+
+        data = resp.json()
         feedbacks = data.get("feedbacks") or []
         logger.info("Fetched %d reviews for imtId=%d", len(feedbacks), imt_id)
 
