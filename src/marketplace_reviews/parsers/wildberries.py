@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 import logging
 from datetime import datetime, timezone
 
@@ -14,7 +15,12 @@ logger = logging.getLogger(__name__)
 _WB_URL_PATTERN = re.compile(r"wildberries\.ru/catalog/(\d+)")
 
 _CARD_DETAIL_URL = "https://card.wb.ru/cards/v4/detail"
-_FEEDBACKS_URL = "https://feedbacks1.wb.ru/feedbacks/v1/{imt_id}"
+_FEEDBACKS_PAGINATED_URL = "https://public-feedbacks.wildberries.ru/api/v1/feedbacks/site"
+_FEEDBACKS_FALLBACK_URL = "https://feedbacks1.wb.ru/feedbacks/v1/{imt_id}"
+
+_TAKE = 30
+_MAX_SKIP = 990  # public endpoint returns 400 when skip > ~1000
+_REQUEST_DELAY = 0.35
 
 
 class WildberriesParser(BaseParser):
@@ -39,7 +45,15 @@ class WildberriesParser(BaseParser):
         """Fetch all reviews for a product identified by nmId."""
         imt_id = self._resolve_imt_id(product_id)
         logger.info("nmId=%d → imtId=%d", product_id, imt_id)
-        return self._fetch_all_feedbacks(imt_id)
+
+        try:
+            reviews = self._fetch_paginated(imt_id)
+            logger.info("Paginated endpoint: got %d reviews", len(reviews))
+        except Exception as e:
+            logger.warning("Paginated endpoint failed (%s), falling back", e)
+            reviews = self._fetch_fallback(imt_id)
+
+        return reviews
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -61,23 +75,63 @@ class WildberriesParser(BaseParser):
             raise ValueError(f"imtId (root) missing for nmId={nm_id}")
         return int(root)
 
-    def _fetch_all_feedbacks(self, imt_id: int) -> list[Review]:
-        """Fetch all feedbacks from the feedbacks1.wb.ru endpoint."""
-        url = _FEEDBACKS_URL.format(imt_id=imt_id)
+    def _fetch_paginated(self, imt_id: int) -> list[Review]:
+        """Fetch reviews via POST endpoint with skip/take pagination.
+
+        Fetches from both directions (newest-first and oldest-first) to
+        maximise coverage — up to ~2000 unique reviews.
+        """
+        seen_ids: set[str] = set()
+        all_reviews: list[Review] = []
+
+        for order in ("dateDesc", "dateAsc"):
+            skip = 0
+            while skip <= _MAX_SKIP:
+                resp = self._session.post(
+                    _FEEDBACKS_PAGINATED_URL,
+                    json={"imtId": imt_id, "take": _TAKE, "skip": skip, "order": order},
+                    headers={"x-service-name": "site"},
+                )
+                resp.raise_for_status()
+                feedbacks = resp.json().get("feedbacks") or []
+
+                if not feedbacks:
+                    break
+
+                for fb in feedbacks:
+                    rid = str(fb.get("id", ""))
+                    if rid not in seen_ids:
+                        all_reviews.append(self._to_review(fb))
+                        seen_ids.add(rid)
+
+                logger.info(
+                    "order=%s skip=%d batch=%d total=%d",
+                    order, skip, len(feedbacks), len(all_reviews),
+                )
+
+                if len(feedbacks) < _TAKE:
+                    break
+
+                skip += _TAKE
+                time.sleep(_REQUEST_DELAY)
+
+        return all_reviews
+
+    def _fetch_fallback(self, imt_id: int) -> list[Review]:
+        """Fallback: single GET to feedbacks1.wb.ru (max ~50 reviews)."""
+        url = _FEEDBACKS_FALLBACK_URL.format(imt_id=imt_id)
         resp = self._session.get(url)
         resp.raise_for_status()
 
         content_type = resp.headers.get("Content-Type", "")
         if "json" not in content_type:
             raise ValueError(
-                f"WB feedbacks returned non-JSON response (Content-Type: {content_type}). "
+                f"WB feedbacks returned non-JSON (Content-Type: {content_type}). "
                 f"The endpoint may be blocked from your network."
             )
 
-        data = resp.json()
-        feedbacks = data.get("feedbacks") or []
-        logger.info("Fetched %d reviews for imtId=%d", len(feedbacks), imt_id)
-
+        feedbacks = resp.json().get("feedbacks") or []
+        logger.info("Fallback: fetched %d reviews for imtId=%d", len(feedbacks), imt_id)
         return [self._to_review(fb) for fb in feedbacks]
 
     @staticmethod
