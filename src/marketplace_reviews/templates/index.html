@@ -50,7 +50,7 @@
 <body>
     <div class="container">
         <h1>Marketplace Reviews</h1>
-        <p class="subtitle">Вставьте ссылку на товар Wildberries — получите еженедельный рейтинг</p>
+        <p class="subtitle">Вставьте ссылку на товар Wildberries — получите еженедельный рейтинг (сбор может занять 1-3 мин.)</p>
 
         <form id="form">
             <div class="form-row">
@@ -104,14 +104,19 @@
             errorEl.style.display = 'none';
             results.style.display = 'none';
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner"></span>Загрузка...';
+            btn.innerHTML = '<span class="spinner"></span>Сбор отзывов...';
 
             try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 300000);
+
                 const resp = await fetch('/analyze', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: 'url=' + encodeURIComponent(url),
+                    signal: controller.signal,
                 });
+                clearTimeout(timeout);
                 const data = await resp.json();
 
                 if (!resp.ok) {

@@ -8,6 +8,7 @@ dependencies = [
     "pandas>=2.0",
     "matplotlib>=3.7",
     "flask>=3.0",
+    "playwright>=1.40",
 ]
 
 [project.scripts]

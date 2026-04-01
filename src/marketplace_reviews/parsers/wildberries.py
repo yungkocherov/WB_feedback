@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
-import time
 import logging
 from datetime import datetime, timezone
 
-import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
 from marketplace_reviews.models import Review
 from marketplace_reviews.parsers.base import BaseParser
@@ -13,126 +13,161 @@ from marketplace_reviews.parsers.base import BaseParser
 logger = logging.getLogger(__name__)
 
 _WB_URL_PATTERN = re.compile(r"wildberries\.ru/catalog/(\d+)")
+_FEEDBACKS_URL_PATTERN = re.compile(r"feedbacks")
 
-_CARD_DETAIL_URL = "https://card.wb.ru/cards/v4/detail"
-_FEEDBACKS_PAGINATED_URL = "https://public-feedbacks.wildberries.ru/api/v1/feedbacks/site"
-_FEEDBACKS_FALLBACK_URL = "https://feedbacks1.wb.ru/feedbacks/v1/{imt_id}"
-
-_TAKE = 30
-_MAX_SKIP = 990  # public endpoint returns 400 when skip > ~1000
-_REQUEST_DELAY = 0.35
+# How many consecutive empty scrolls before we stop
+_MAX_IDLE_SCROLLS = 15
+_SCROLL_PAUSE_MS = 800
 
 
 class WildberriesParser(BaseParser):
-
-    def __init__(self, session: requests.Session | None = None) -> None:
-        self._session = session or requests.Session()
-        self._session.headers.setdefault("User-Agent", "Mozilla/5.0")
-        self._session.headers.setdefault("Referer", "https://www.wildberries.ru")
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def parse_url(self, url: str) -> int:
-        """Extract nmId from a Wildberries product URL."""
         m = _WB_URL_PATTERN.search(url)
         if not m:
             raise ValueError(f"Cannot extract nmId from URL: {url}")
         return int(m.group(1))
 
     def fetch_reviews(self, product_id: int) -> list[Review]:
-        """Fetch all reviews for a product identified by nmId."""
-        imt_id = self._resolve_imt_id(product_id)
-        logger.info("nmId=%d → imtId=%d", product_id, imt_id)
-
-        try:
-            reviews = self._fetch_paginated(imt_id)
-            logger.info("Paginated endpoint: got %d reviews", len(reviews))
-        except Exception as e:
-            logger.warning("Paginated endpoint failed (%s), falling back", e)
-            reviews = self._fetch_fallback(imt_id)
-
-        return reviews
+        url = f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx"
+        return self._scrape_reviews(url)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Playwright scraper
     # ------------------------------------------------------------------
 
-    def _resolve_imt_id(self, nm_id: int) -> int:
-        """Get imtId (root card id) required by the feedbacks endpoint."""
-        resp = self._session.get(
-            _CARD_DETAIL_URL,
-            params={"appType": 1, "curr": "rub", "dest": -1257786, "nm": nm_id},
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        products = body.get("data", {}).get("products") or body.get("products") or []
-        if not products:
-            raise ValueError(f"Product not found for nmId={nm_id}")
-        root = products[0].get("root")
-        if root is None:
-            raise ValueError(f"imtId (root) missing for nmId={nm_id}")
-        return int(root)
-
-    def _fetch_paginated(self, imt_id: int) -> list[Review]:
-        """Fetch reviews via POST endpoint with skip/take pagination.
-
-        Fetches from both directions (newest-first and oldest-first) to
-        maximise coverage — up to ~2000 unique reviews.
-        """
+    def _scrape_reviews(self, url: str) -> list[Review]:
         seen_ids: set[str] = set()
         all_reviews: list[Review] = []
 
-        for order in ("dateDesc", "dateAsc"):
-            skip = 0
-            while skip <= _MAX_SKIP:
-                resp = self._session.post(
-                    _FEEDBACKS_PAGINATED_URL,
-                    json={"imtId": imt_id, "take": _TAKE, "skip": skip, "order": order},
-                    headers={"x-service-name": "site"},
-                )
-                resp.raise_for_status()
-                feedbacks = resp.json().get("feedbacks") or []
+        def _on_response(response):
+            """Intercept XHR responses containing feedbacks."""
+            try:
+                if not _FEEDBACKS_URL_PATTERN.search(response.url):
+                    return
+                if response.status != 200:
+                    return
+                ct = response.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
 
-                if not feedbacks:
-                    break
-
+                body = response.json()
+                feedbacks = body.get("feedbacks") or []
                 for fb in feedbacks:
                     rid = str(fb.get("id", ""))
-                    if rid not in seen_ids:
+                    if rid and rid not in seen_ids:
                         all_reviews.append(self._to_review(fb))
                         seen_ids.add(rid)
+            except Exception:
+                pass
 
-                logger.info(
-                    "order=%s skip=%d batch=%d total=%d",
-                    order, skip, len(feedbacks), len(all_reviews),
-                )
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="ru-RU",
+            )
+            page = context.new_page()
+            page.on("response", _on_response)
 
-                if len(feedbacks) < _TAKE:
-                    break
+            logger.info("Opening %s", url)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_timeout(2000)
 
-                skip += _TAKE
-                time.sleep(_REQUEST_DELAY)
+            # Click the reviews tab to open feedbacks section
+            self._open_reviews_tab(page)
+            page.wait_for_timeout(2000)
+            logger.info("Reviews tab opened, intercepted %d so far", len(all_reviews))
+
+            # Click "Show all reviews" if such button exists
+            self._click_show_all(page)
+            page.wait_for_timeout(2000)
+
+            # Scroll to load more reviews
+            idle_count = 0
+            prev_count = len(all_reviews)
+
+            while idle_count < _MAX_IDLE_SCROLLS:
+                page.evaluate("window.scrollBy(0, 3000)")
+                page.wait_for_timeout(_SCROLL_PAUSE_MS)
+
+                current = len(all_reviews)
+                if current > prev_count:
+                    idle_count = 0
+                    prev_count = current
+                    logger.info("Scrolling... %d reviews collected", current)
+                else:
+                    idle_count += 1
+
+                # Try clicking "load more" button if present
+                self._click_load_more(page)
+
+            logger.info("Done scrolling. Total reviews: %d", len(all_reviews))
+            browser.close()
 
         return all_reviews
 
-    def _fetch_fallback(self, imt_id: int) -> list[Review]:
-        """Fallback: single GET to feedbacks1.wb.ru (max ~50 reviews)."""
-        url = _FEEDBACKS_FALLBACK_URL.format(imt_id=imt_id)
-        resp = self._session.get(url)
-        resp.raise_for_status()
+    @staticmethod
+    def _open_reviews_tab(page):
+        """Click on the reviews/feedbacks tab."""
+        selectors = [
+            "button.product-page__tab[data-tab='feedback']",
+            "[data-tab='feedback']",
+            "a[href*='feedbacks']",
+            "text=Отзыв",
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=1000):
+                    el.click()
+                    return
+            except Exception:
+                continue
 
-        content_type = resp.headers.get("Content-Type", "")
-        if "json" not in content_type:
-            raise ValueError(
-                f"WB feedbacks returned non-JSON (Content-Type: {content_type}). "
-                f"The endpoint may be blocked from your network."
-            )
+    @staticmethod
+    def _click_show_all(page):
+        """Click 'Show all reviews' link if present."""
+        selectors = [
+            "text=Все отзывы",
+            "text=Смотреть все",
+            "text=Показать все",
+            "a.comments__btn-all",
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=1000):
+                    el.click()
+                    return
+            except Exception:
+                continue
 
-        feedbacks = resp.json().get("feedbacks") or []
-        logger.info("Fallback: fetched %d reviews for imtId=%d", len(feedbacks), imt_id)
-        return [self._to_review(fb) for fb in feedbacks]
+    @staticmethod
+    def _click_load_more(page):
+        """Click 'Load more' if present."""
+        selectors = [
+            "button.comments__more-btn",
+            "text=Показать ещё",
+            "text=Показать еще",
+        ]
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=300):
+                    el.click()
+                    return
+            except Exception:
+                continue
 
     @staticmethod
     def _to_review(fb: dict) -> Review:
