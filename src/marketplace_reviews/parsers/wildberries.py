@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 _WB_URL_PATTERN = re.compile(r"wildberries\.ru/catalog/(\d+)")
 
-_CARD_DETAIL_URL = "https://card.wb.ru/cards/v2/detail"
+_CARD_DETAIL_URL = "https://card.wb.ru/cards/v4/detail"
 _FEEDBACKS_URL = "https://public-feedbacks.wildberries.ru/api/v1/feedbacks/site"
 
 _PAGE_SIZE = 30
